@@ -16,10 +16,19 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
 import config
-from models import ComplianceReport, ScanHistoryItem, ExtractedLabelData
+from models import (
+    ComplianceReport,
+    ScanHistoryItem,
+    ExtractedLabelData,
+    CanonicalPackagingData,
+    UploadedImageMetadata,
+    FieldObservation
+)
 from extractor import LabelExtractor
 from rules_engine import LegalMetrologyRulesEngine
 from pdf_generator import InspectionNoticePDFGenerator
+from image_validator import validate_and_inspect_image, validate_panel_tag
+from PIL import Image
 import db
 
 app = FastAPI(
@@ -103,18 +112,32 @@ def get_sample_datasets():
 @app.post("/api/scan", response_model=ComplianceReport)
 async def scan_label(
     file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    panel_tags: Optional[List[str]] = Form(None),
     sample_id: Optional[str] = Form(None),
     x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-Api-Key")
 ):
     """
-    Scans a packaged commodity label image, extracts mandatory declarations
-    via Gemini / Vision Parser, evaluates against Legal Metrology Rules 2011,
-    generates an official PDF report, and stores record in the database.
+    Scans 1 to 4 packaged commodity label images or pre-configured sample datasets.
+    Extracts mandatory declarations into canonical field observations, evaluates
+    statutory compliance under Legal Metrology Rules 2011, generates PDF notice,
+    and stores audit record in SQLite database.
     """
     scan_id = str(uuid.uuid4())
-    # Normalize FastAPI dependency wrappers if called directly
     clean_sample_id = sample_id if (isinstance(sample_id, str) and sample_id.strip()) else None
     clean_api_key = x_gemini_api_key if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
+
+    # Collect incoming files
+    upload_list: List[UploadFile] = []
+    if files:
+        upload_list.extend([f for f in files if f and f.filename])
+    if file and file.filename:
+        # Avoid duplicate if same file object was provided in both file and files
+        if not any(f.filename == file.filename for f in upload_list):
+            upload_list.insert(0, file)
+
+    uploaded_metadata_list: List[UploadedImageMetadata] = []
+    images_to_extract: List[Tuple[Path, str]] = []
 
     if clean_sample_id:
         sample_map = {
@@ -127,28 +150,83 @@ async def scan_label(
         src_path = config.SAMPLES_DIR / filename
         if not src_path.exists():
             raise HTTPException(status_code=404, detail="Sample image not found")
-        
+
         image_filename = f"scan_{scan_id[:8]}_{filename}"
         saved_path = config.UPLOAD_DIR / image_filename
         shutil.copyfile(src_path, saved_path)
         image_url = f"/static/uploads/{image_filename}"
 
-    elif file:
-        file_ext = Path(file.filename).suffix or ".jpg"
-        image_filename = f"scan_{scan_id[:8]}{file_ext}"
-        saved_path = config.UPLOAD_DIR / image_filename
-        
-        with open(saved_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        image_url = f"/static/uploads/{image_filename}"
-        
-    else:
-        raise HTTPException(status_code=400, detail="Either 'file' or 'sample_id' must be provided.")
+        with Image.open(saved_path) as s_img:
+            s_w, s_h = s_img.size
 
-    # 1. Extraction Layer (Live Gemini Multimodal Vision AI)
+        sample_meta = UploadedImageMetadata(
+            filename=image_filename,
+            panel="front",
+            mime_type="image/png",
+            size_bytes=saved_path.stat().st_size,
+            width=s_w,
+            height=s_h,
+            image_url=image_url
+        )
+        uploaded_metadata_list = [sample_meta]
+        images_to_extract = [(saved_path, "front")]
+
+    elif upload_list:
+        if len(upload_list) > 4:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum 4 images allowed per scan (received {len(upload_list)})."
+            )
+
+        # Parse panel_tags
+        parsed_tags: List[str] = []
+        if panel_tags:
+            for item in panel_tags:
+                if isinstance(item, str):
+                    for part in item.split(","):
+                        cleaned = part.strip()
+                        if cleaned:
+                            parsed_tags.append(validate_panel_tag(cleaned))
+
+        default_panels = ["front", "back", "side", "panel"]
+        assigned_tags: List[str] = []
+        for i in range(len(upload_list)):
+            if i < len(parsed_tags):
+                assigned_tags.append(parsed_tags[i])
+            else:
+                assigned_tags.append(default_panels[min(i, 3)])
+
+        # Validate and save each image
+        for i, up_file in enumerate(upload_list):
+            panel_tag = assigned_tags[i]
+            content, meta = await validate_and_inspect_image(up_file, panel=panel_tag)
+
+            file_ext = Path(up_file.filename).suffix or f".{meta.mime_type.split('/')[-1]}"
+            if not file_ext.startswith("."):
+                file_ext = f".{file_ext}"
+
+            saved_filename = f"scan_{scan_id[:8]}_{panel_tag}_{Path(up_file.filename).stem}{file_ext}"
+            saved_path = config.UPLOAD_DIR / saved_filename
+
+            with open(saved_path, "wb") as buffer:
+                buffer.write(content)
+
+            meta.filename = saved_filename
+            meta.image_url = f"/static/uploads/{saved_filename}"
+
+            uploaded_metadata_list.append(meta)
+            images_to_extract.append((saved_path, panel_tag))
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'file', 'files', or 'sample_id' must be provided."
+        )
+
+    # 1. Extraction Layer (Single or Multi-panel Vision AI)
     try:
-        extracted_data = LabelExtractor.extract_from_image(
-            image_path=saved_path,
+        extracted_data, canonical_data = LabelExtractor.extract_from_images(
+            images=images_to_extract,
             custom_api_key=clean_api_key,
             sample_id=clean_sample_id
         )
@@ -159,12 +237,17 @@ async def scan_label(
             detail=str(e)
         )
 
+    primary_image_filename = uploaded_metadata_list[0].filename
+    primary_image_url = uploaded_metadata_list[0].image_url
+
     # 2. Evaluation Layer (Legal Metrology Rules 2011 Engine)
     report = LegalMetrologyRulesEngine.evaluate(
         extracted=extracted_data,
         scan_id=scan_id,
-        image_filename=image_filename,
-        image_url=image_url
+        image_filename=primary_image_filename,
+        image_url=primary_image_url,
+        canonical_data=canonical_data,
+        images=uploaded_metadata_list
     )
 
     # 3. PDF Generation Layer

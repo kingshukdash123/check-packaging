@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, BarChart3, AlertTriangle } from 'lucide-react';
+import { analyticsService } from '../../services/index.js';
 
 export default function AnalyticsModal({ isOpen, onClose }) {
   const [stats, setStats] = useState(null);
@@ -8,8 +9,7 @@ export default function AnalyticsModal({ isOpen, onClose }) {
   useEffect(() => {
     if (isOpen) {
       setIsLoading(true);
-      fetch('/api/analytics')
-        .then(res => res.json())
+      analyticsService.getAnalyticsSummary()
         .then(data => setStats(data))
         .catch(err => console.error("Error loading analytics:", err))
         .finally(() => setIsLoading(false));

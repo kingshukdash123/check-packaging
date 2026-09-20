@@ -2,13 +2,20 @@ import os
 import sys
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from models import ExtractedLabelData, RuleCheckResult, USPMathCheck, ComplianceReport
+from models import (
+    ExtractedLabelData,
+    RuleCheckResult,
+    USPMathCheck,
+    ComplianceReport,
+    CanonicalPackagingData,
+    UploadedImageMetadata
+)
 
 
 class LegalMetrologyRulesEngine:
@@ -18,7 +25,14 @@ class LegalMetrologyRulesEngine:
     """
 
     @staticmethod
-    def evaluate(extracted: ExtractedLabelData, scan_id: str, image_filename: str, image_url: str = None) -> ComplianceReport:
+    def evaluate(
+        extracted: ExtractedLabelData,
+        scan_id: str,
+        image_filename: str,
+        image_url: str = None,
+        canonical_data: Optional[CanonicalPackagingData] = None,
+        images: Optional[List[UploadedImageMetadata]] = None
+    ) -> ComplianceReport:
         checks: List[RuleCheckResult] = []
         
         # 1. Rule 6(1)(a) - Manufacturer / Packer / Importer Details
@@ -106,7 +120,9 @@ class LegalMetrologyRulesEngine:
             warning_count=warnings,
             rule_results=checks,
             usp_check=usp_math,
-            extracted_data=extracted
+            extracted_data=extracted,
+            canonical_data=canonical_data or extracted.to_canonical(default_panel="front"),
+            images=images or []
         )
 
     # ------------------ RULE IMPLEMENTATIONS ------------------ #

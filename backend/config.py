@@ -9,6 +9,7 @@ load_dotenv(BASE_DIR / ".env")
 load_dotenv(BACKEND_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 REPORTS_DIR = DATA_DIR / "reports"

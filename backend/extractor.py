@@ -5,26 +5,34 @@ import base64
 import logging
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple, Dict, Any
 from PIL import Image
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from models import ExtractedLabelData
+from models import ExtractedLabelData, CanonicalPackagingData, FieldObservation
 import config
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an expert Legal Metrology & Food Safety Compliance Inspector under the Department of Consumer Affairs (DoCA), Government of India.
-Analyze the provided packaged commodity / food packet label image thoroughly and extract all mandatory declarations required under the Legal Metrology (Packaged Commodities) Rules, 2011 (PCR 2011) and FSSAI packaging guidelines.
+Analyze the provided packaged commodity / food packet label images thoroughly across all panels (e.g. Front, Back, Side, Nutritional panel).
+Extract all mandatory declarations required under the Legal Metrology (Packaged Commodities) Rules, 2011 (PCR 2011) and FSSAI packaging guidelines.
 
-Extract the following declarations with maximum accuracy:
+For each field, extract:
+- "value": The normalized typed value (e.g., number, string, boolean, or null if absent)
+- "raw_text": Verbatim text as physically printed on the package
+- "confidence": Float between 0.0 and 1.0 representing OCR/detection confidence (0.95+ for sharp text, 0.6-0.8 for partial/curved, 0.0 if not found)
+- "source_image": The panel identifier where this was observed ("front", "back", "side", "panel")
+- "evidence_text": The immediate surrounding text context
+
+Extract these mandatory declarations:
 1. Brand Name & Generic/Common Commodity Name (Rule 6(1)(b)).
 2. Name and physical address of Manufacturer / Packer / Importer (Rule 6(1)(a)).
 3. Net Quantity with numeric value and standard unit (g, kg, ml, l, N) (Rule 6(1)(c)).
-4. Maximum Retail Price (MRP), raw text, amount, and whether "incl. of all taxes" / "inclusive of all taxes" is present (Rule 6(1)(e)).
+4. Maximum Retail Price (MRP), raw text, numeric amount, and whether "incl. of all taxes" is present (Rule 6(1)(e)).
 5. Unit Sale Price (USP) e.g., Rs. 0.40/g or Rs. 25.00/100g if declared (Rule 6(11)).
 6. Month and Year of Manufacture / Pre-packing / Import (Rule 6(1)(d)).
 7. Consumer Care Details: contact person/designation, phone/toll-free, email ID, and postal address (Rule 6(1)(n)).
@@ -34,22 +42,49 @@ Extract the following declarations with maximum accuracy:
 11. Detected languages on the package (Rule 9).
 12. Full raw text transcript of the label.
 
-Return strictly valid JSON conforming to the requested schema. If a field is not found, set it as null or empty string."""
+Return strictly valid JSON conforming to the requested schema. Never invent values. If a declaration is missing, set its value to null, raw_text to "", and confidence to 0.0."""
 
 
 class LabelExtractor:
     """
-    Extracts structured Legal Metrology declarations from packaging label images
-    using Gemini Multimodal Vision API. No mock/dummy data is returned on live uploads.
+    Extracts structured Legal Metrology declarations from single or multi-panel
+    packaging images using Gemini Multimodal Vision API.
     """
 
     @classmethod
-    def extract_from_image(cls, image_path: Path, custom_api_key: Optional[str] = None, sample_id: Optional[str] = None) -> ExtractedLabelData:
+    def extract_from_image(
+        cls,
+        image_path: Path,
+        custom_api_key: Optional[str] = None,
+        sample_id: Optional[str] = None,
+        panel_tag: str = "front"
+    ) -> ExtractedLabelData:
+        """Backward-compatible single-image extraction entrypoint."""
+        extracted, _ = cls.extract_from_images(
+            images=[(image_path, panel_tag)],
+            custom_api_key=custom_api_key,
+            sample_id=sample_id
+        )
+        return extracted
+
+    @classmethod
+    def extract_from_images(
+        cls,
+        images: List[Tuple[Path, str]],
+        custom_api_key: Optional[str] = None,
+        sample_id: Optional[str] = None
+    ) -> Tuple[ExtractedLabelData, CanonicalPackagingData]:
+        """
+        Multi-panel packaging extraction entrypoint.
+        Returns both legacy ExtractedLabelData and CanonicalPackagingData.
+        """
         # If user explicitly selected a pre-configured demo test case
         if sample_id:
-            return cls._get_sample_fixture(sample_id)
+            extracted = cls._get_sample_fixture(sample_id)
+            canonical = extracted.to_canonical(default_panel="front")
+            return extracted, canonical
 
-        # For actual uploaded/photographed packaging images:
+        # Resolve Gemini API Key
         api_key_str = ""
         if isinstance(custom_api_key, str) and custom_api_key.strip():
             api_key_str = custom_api_key.strip()
@@ -63,86 +98,96 @@ class LabelExtractor:
                 "Gemini API Key is missing or invalid. Please configure a valid Google Gemini API key in '.env' or click 'Configure API Key' in the top navigation bar to scan real images."
             )
 
-        # Perform live Vision AI extraction
-        return cls._extract_with_gemini(image_path, api_key_str)
+        return cls._extract_with_gemini(images, api_key_str)
 
     @classmethod
-    def _extract_with_gemini(cls, image_path: Path, api_key: str) -> ExtractedLabelData:
+    def _extract_with_gemini(
+        cls,
+        images: List[Tuple[Path, str]],
+        api_key: str
+    ) -> Tuple[ExtractedLabelData, CanonicalPackagingData]:
         try:
             from google import genai
             from google.genai import types
 
             client = genai.Client(api_key=api_key)
-            
-            with open(image_path, "rb") as f:
-                image_bytes = f.read()
 
-            mime_type = "image/jpeg"
-            if str(image_path).lower().endswith(".png"):
-                mime_type = "image/png"
-            elif str(image_path).lower().endswith(".webp"):
-                mime_type = "image/webp"
+            # Build multimodal contents with panel tags
+            contents_payload = []
+            for img_path, panel_tag in images:
+                with open(img_path, "rb") as f:
+                    img_bytes = f.read()
 
-            prompt_text = (
+                mtype = "image/jpeg"
+                lower_p = str(img_path).lower()
+                if lower_p.endswith(".png"):
+                    mtype = "image/png"
+                elif lower_p.endswith(".webp"):
+                    mtype = "image/webp"
+
+                contents_payload.append(
+                    types.Part.from_text(text=f"[PACKAGING PANEL IDENTIFIER: {panel_tag.upper()}]")
+                )
+                contents_payload.append(
+                    types.Part.from_bytes(data=img_bytes, mime_type=mtype)
+                )
+
+            schema_guide = (
                 f"{SYSTEM_PROMPT}\n\n"
                 "Return a single JSON object matching this schema:\n"
                 "{\n"
-                '  "brand_name": "string",\n'
-                '  "generic_name": "string",\n'
-                '  "commodity_category": "string",\n'
-                '  "manufacturer_name": "string",\n'
-                '  "manufacturer_address": "string",\n'
-                '  "packer_name": "string or null",\n'
-                '  "packer_address": "string or null",\n'
-                '  "importer_name": "string or null",\n'
-                '  "importer_address": "string or null",\n'
-                '  "country_of_origin": "string",\n'
-                '  "net_quantity_raw": "string",\n'
-                '  "net_quantity_value": float or null,\n'
-                '  "net_quantity_unit": "string or null",\n'
-                '  "mrp_raw": "string",\n'
-                '  "mrp_amount": float or null,\n'
-                '  "mrp_has_inclusive_phrase": boolean,\n'
-                '  "unit_sale_price_raw": "string or null",\n'
-                '  "unit_sale_price_value": float or null,\n'
-                '  "unit_sale_price_unit": "string or null",\n'
-                '  "mfg_date_raw": "string or null",\n'
-                '  "exp_date_raw": "string or null",\n'
-                '  "batch_or_lot_no": "string or null",\n'
-                '  "consumer_care_name_desig": "string or null",\n'
-                '  "consumer_care_phone": "string or null",\n'
-                '  "consumer_care_email": "string or null",\n'
-                '  "consumer_care_address": "string or null",\n'
-                '  "fssai_lic_no": "string or null",\n'
-                '  "veg_nonveg_status": "Veg" | "Non-Veg" | "None",\n'
-                '  "font_size_adequate": boolean,\n'
-                '  "principal_display_panel_notes": "string",\n'
+                '  "brand_name": {"value": "string", "raw_text": "string", "confidence": float, "source_image": "front"},\n'
+                '  "generic_name": {"value": "string", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "commodity_category": {"value": "string", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "manufacturer_name": {"value": "string", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "manufacturer_address": {"value": "string", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "packer_name": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "packer_address": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "importer_name": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "importer_address": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "country_of_origin": {"value": "string", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "net_quantity_value": {"value": float or null, "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "net_quantity_unit": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "mrp_amount": {"value": float or null, "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "mrp_tax_inclusive": {"value": boolean, "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "declared_usp_amount": {"value": float or null, "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "declared_usp_unit": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "mfg_date": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "exp_date": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "batch_number": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "consumer_care_person": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "consumer_care_phone": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "consumer_care_email": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "consumer_care_address": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "fssai_license": {"value": "string or null", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "veg_nonveg_mark": {"value": "Veg" | "Non-Veg" | "None", "raw_text": "string", "confidence": float, "source_image": "string"},\n'
+                '  "legibility_adequate": {"value": boolean, "raw_text": "string", "confidence": float, "source_image": "string"},\n'
                 '  "detected_languages": ["English", "Hindi"],\n'
-                '  "raw_ocr_text": "string"\n'
+                '  "raw_ocr_dump": "string"\n'
                 "}"
             )
+            contents_payload.append(types.Part.from_text(text=schema_guide))
 
-            models_to_try = [
-                'gemini-3.5-flash',
-                'gemini-3.1-flash-lite',
-                'gemini-flash-latest',
-                'gemini-2.5-pro',
-                'gemini-pro-latest',
+            # Prioritize lower, high-quota models (Flash & Flash-Lite) to avoid Free Tier 429 quota exhaustion (Pro models have limit: 0)
+            preferred_model = getattr(config, 'GEMINI_MODEL', None) or os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+            candidate_models = [
+                preferred_model,
                 'gemini-3.6-flash',
-                'gemini-3.7-flash'
+                'gemini-3.5-flash',
+                'gemini-3.7-flash',
+                'gemini-3.8-flash',
+                'gemini-flash-latest'
             ]
+            models_to_try = [m for m in dict.fromkeys(candidate_models) if m]
             response = None
             last_err = None
 
             for model_name in models_to_try:
                 try:
-                    print(f"[*] [Gemini Vision AI] Sending package image to model: {model_name}...")
+                    print(f"[*] [Gemini Vision AI] Sending {len(images)} packaging panel(s) to model: {model_name}...")
                     response = client.models.generate_content(
                         model=model_name,
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                            prompt_text
-                        ],
+                        contents=contents_payload,
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             temperature=0.1
@@ -169,10 +214,62 @@ class LabelExtractor:
                     lines = lines[:-1]
                 raw_json_str = "\n".join(lines).strip()
 
-            data_dict = json.loads(raw_json_str)
-            return ExtractedLabelData(**data_dict)
+            parsed = json.loads(raw_json_str)
+
+            # Helper to normalize field dict into FieldObservation
+            def parse_obs(key: str, default_val: Any = None, default_panel: str = images[0][1]) -> Optional[FieldObservation]:
+                raw = parsed.get(key)
+                if raw is None:
+                    if default_val is not None:
+                        return FieldObservation(value=default_val, raw_text=str(default_val), source_image=default_panel)
+                    return None
+                if isinstance(raw, dict):
+                    v = raw.get("value", default_val)
+                    t = str(raw.get("raw_text") or (v if v is not None else ""))
+                    c = float(raw.get("confidence", 0.95))
+                    s = str(raw.get("source_image") or default_panel).lower()
+                    e = str(raw.get("evidence_text") or t)
+                    return FieldObservation(value=v, raw_text=t, confidence=c, source_image=s, evidence_text=e)
+                else:
+                    return FieldObservation(value=raw, raw_text=str(raw), confidence=0.95, source_image=default_panel, evidence_text=str(raw))
+
+            canonical = CanonicalPackagingData(
+                brand_name=parse_obs("brand_name", "Unknown Brand") or FieldObservation(value="Unknown Brand", raw_text="Unknown Brand"),
+                generic_name=parse_obs("generic_name"),
+                commodity_category=parse_obs("commodity_category", "Food / FMCG") or FieldObservation(value="Food / FMCG", raw_text="Food / FMCG"),
+                manufacturer_name=parse_obs("manufacturer_name"),
+                manufacturer_address=parse_obs("manufacturer_address"),
+                packer_name=parse_obs("packer_name"),
+                packer_address=parse_obs("packer_address"),
+                importer_name=parse_obs("importer_name"),
+                importer_address=parse_obs("importer_address"),
+                country_of_origin=parse_obs("country_of_origin", "India") or FieldObservation(value="India", raw_text="India"),
+                net_quantity_value=parse_obs("net_quantity_value"),
+                net_quantity_unit=parse_obs("net_quantity_unit"),
+                mrp_amount=parse_obs("mrp_amount"),
+                mrp_tax_inclusive=parse_obs("mrp_tax_inclusive"),
+                declared_usp_amount=parse_obs("declared_usp_amount"),
+                declared_usp_unit=parse_obs("declared_usp_unit"),
+                mfg_date=parse_obs("mfg_date"),
+                exp_date=parse_obs("exp_date"),
+                batch_number=parse_obs("batch_number"),
+                consumer_care_person=parse_obs("consumer_care_person"),
+                consumer_care_phone=parse_obs("consumer_care_phone"),
+                consumer_care_email=parse_obs("consumer_care_email"),
+                consumer_care_address=parse_obs("consumer_care_address"),
+                fssai_license=parse_obs("fssai_license"),
+                veg_nonveg_mark=parse_obs("veg_nonveg_mark"),
+                detected_languages=parsed.get("detected_languages") or ["English"],
+                legibility_adequate=parse_obs("legibility_adequate", True) or FieldObservation(value=True, raw_text="Adequate"),
+                raw_ocr_dump=str(parsed.get("raw_ocr_dump") or "")
+            )
+
+            extracted = canonical.to_extracted_label_data()
+            return extracted, canonical
 
         except Exception as e:
+            logger.error(f"Gemini Vision Extraction Error: {e}")
+            raise RuntimeError(f"AI Extraction Failed: {str(e)}")
             logger.error(f"Gemini Vision Extraction Error: {e}")
             raise RuntimeError(f"AI Extraction Failed: {str(e)}")
 
